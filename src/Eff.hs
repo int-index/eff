@@ -15,6 +15,7 @@
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE UndecidableSuperClasses #-}
 {-# LANGUAGE TypeInType #-}
+{-# LANGUAGE ApplicativeDo #-}
 
 module Eff where
 
@@ -23,22 +24,24 @@ import GHC.Exts (Constraint)
 
 data family Dict (eff :: k) (m :: Type -> Type) :: Type
 
-type family Super (eff :: k) (m :: Type -> Type) :: Constraint
+type family Super (eff :: k) (m :: km) :: Constraint
 
 class Super eff m => eff <: (m :: Type -> Type) where
   dict :: Dict eff m
 
 instance {-# OVERLAPPABLE #-}
-  ( baseEff <: m,
-    eff <: m,
-    Lift baseEff eff t,
+  ( eff <: m,
+    Lift eff t,
     Super eff (t m) ) =>
       (eff :: Type) <: t m
   where
     dict = lift dict
 
-class Lift baseEff eff t | eff t -> baseEff where
-  lift :: baseEff <: m => Dict eff m -> Dict eff (t m)
+class Handle baseEff eff t | eff t -> baseEff where
+  handle :: baseEff <: m => Dict eff (t m)
+
+class Lift eff t where
+  lift :: Dict eff m -> Dict eff (t m)
 
 -- CONSTRAINT
 
@@ -47,10 +50,13 @@ type MConstraint = (Type -> Type) -> Constraint
 data instance Dict (c :: MConstraint) m where
   MDict :: c m => Dict c m
 
-type instance Super (c :: MConstraint) m = c m
+type instance Super (c :: km -> Constraint) (m :: km) = c m
 
-instance Super c m => (c :: MConstraint) <: m where
-  dict = MDict
+instance
+  (Super c m, km ~ (Type -> Type)) =>
+    (c :: km -> Constraint) <: m
+  where
+    dict = MDict
 
 -- UNIT
 
@@ -65,21 +71,21 @@ instance '() <: m where
 
 -- 2
 
-data instance Dict '(f, g) m = PDict2 (Dict f m) (Dict g m)
+data instance Dict '(f, g) m = P2Dict (Dict f m) (Dict g m)
 
 type instance Super '(f, g) m = (f <: m, g <: m)
 
 instance Super '(f, g) m => '(f, g) <: m where
-  dict = PDict2 dict dict
+  dict = P2Dict dict dict
 
 -- 3
 
-data instance Dict '(f, g, h) m = PDict3 (Dict f m) (Dict g m) (Dict h m)
+data instance Dict '(f, g, h) m = P3Dict (Dict f m) (Dict g m) (Dict h m)
 
 type instance Super '(f, g, h) m = (f <: m, g <: m, h <: m)
 
 instance Super '(f, g, h) m => '(f, g, h) <: m where
-  dict = PDict3 dict dict dict
+  dict = P3Dict dict dict dict
 
 -- LIST
 
@@ -103,7 +109,7 @@ data R (r :: Type)
 
 data instance Dict (R r) m = RDict
   { _ask    :: m r,
-    _local  :: (r -> r) -> m r -> m r,
+    _local  :: forall a . (r -> r) -> m a -> m a,
     _reader :: forall a . (r -> a) -> m a }
 
 type instance Super (R r) m = ()
@@ -111,7 +117,7 @@ type instance Super (R r) m = ()
 ask :: (R r <: m) => m r
 ask = _ask dict
 
-local :: (R r <: m) => (r -> r) -> m r -> m r
+local :: (R r <: m) => (r -> r) -> m a -> m a
 local = _local dict
 
 reader :: (R r <: m) => (r -> a) -> m a
@@ -120,15 +126,6 @@ reader = _reader dict
 -- READER IMPL
 
 newtype ReaderT r m a = ReaderT (r -> m a)
-
-instance Lift Applicative Applicative (ReaderT r) where
-  lift MDict = MDict
-
-instance Lift Functor Functor (ReaderT r) where
-  lift MDict = MDict
-
-instance Lift Monad Monad (ReaderT r) where
-  lift MDict = MDict
 
 runReaderT :: ReaderT r m a -> r -> m a
 runReaderT (ReaderT k) = k
@@ -153,21 +150,36 @@ instance Monad m => Monad (ReaderT r m) where
   (>>=) ma f =
     ReaderT (\r -> runReaderT ma r >>= \a -> runReaderT (f a) r)
 
-instance Lift '() (R r) (ReaderT r') where
+instance Lift Applicative (ReaderT r) where
+  lift MDict = MDict
+
+instance Lift Functor (ReaderT r) where
+  lift MDict = MDict
+
+instance Lift Monad (ReaderT r) where
+  lift MDict = MDict
+
+instance Lift (R r') (ReaderT r) where
   lift r = RDict
     { _ask    = ReaderT (\_ -> _ask r),
       _local  = \f -> mapReaderT (_local r f),
       _reader = \f -> ReaderT (\_ -> _reader r f) }
 
-instance Monad <: m => R r <: ReaderT r m where
-  dict = RDict
+-- TODO: HasLens instead of equivalence
+instance r ~ r' => Handle Applicative (R r') (ReaderT r) where
+  handle = RDict
     { _ask    = ReaderT pure,
       _local  = withReaderT,
       _reader = \f -> ReaderT (pure . f) }
 
-ex1 :: '(Monad, '[R Int, R String]) <: m => m Int
+instance Applicative <: m => R r <: ReaderT r m where
+  dict = handle
+
+-- EXAMPLES
+
+ex1 :: '(Applicative, R Int, R String) <: m => m Int
 ex1 = do
-  local (*2) $ do
+  local @Int (*2) $ do
     a <- ask @Int
     b <- ask @String
     return (a + length b)
